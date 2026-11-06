@@ -586,11 +586,16 @@ async function webpDecode(buf){
   await dec.tracks.ready;
   await dec.completed;
   const track = dec.tracks.selectedTrack;
-  const n = (track && track.frameCount) || 1;
+  const counted = (track && track.frameCount) || 1;
   const frames = [];
   let W = 0, H = 0;
-  for (let i = 0; i < n; i++){
-    const { image } = await dec.decode({ frameIndex: i });
+  // walk frames until decode stops returning one: some encoders report
+  // frameCount 1 for a file that actually holds an animation
+  let limit = Math.max(counted, 1), i = 0;
+  while (i < limit && i < 600){
+    let image;
+    try { ({ image } = await dec.decode({ frameIndex: i })); }
+    catch (e) { break; }
     const cv = document.createElement('canvas');
     cv.width = image.displayWidth; cv.height = image.displayHeight;
     const ctx = cv.getContext('2d', { willReadFrequently: true });
@@ -599,7 +604,10 @@ async function webpDecode(buf){
     const delay = Math.max(2, Math.round((image.duration || 100000) / 10000));
     frames.push({ data: ctx.getImageData(0, 0, W, H).data, delay, w: W, h: H });
     if (image.close) image.close();
+    i++;
+    if (i >= limit) limit = Math.min(600, i + 1);
   }
+  if (!frames.length) throw new Error('no frames in that webp');
   return { W, H, frames, loop: 0 };
 }
 
@@ -659,6 +667,7 @@ async function videoDecode(file, fps, onProgress){
 /*CORE-END*/
 
 /* ---------------- UI ---------------- */
+const BUILD = 5;
 const $ = (id) => document.getElementById(id);
 const elBlock = $('block'), elPal = $('pal'), elDither = $('dither');
 const elVBlock = $('vBlock'), elMeta = $('meta'), elSave = $('save');
@@ -741,7 +750,7 @@ function rebuild(){
     src.frames.length + ' frames  ' + src.W + 'x' + src.H + '\n' +
     'art ' + result.small[0] + 'x' + result.small[1] + '  ' + result.palette.length + ' colours\n' +
     'out ' + result.W + 'x' + result.H + '  ' + ms + 'ms' +
-    (src.note ? '\n' + src.note : '');
+    (src.note ? '\n' + src.note : '') + '\nbuild ' + BUILD;
   elSave.disabled = false;
   buildStage();
   play();
