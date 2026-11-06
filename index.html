@@ -575,6 +575,7 @@ async function webpDecode(buf){
     throw new Error('this browser cannot read webp frames - use Chrome, Edge or Safari 17+');
   }
   const dec = new ImageDecoder({ data: buf, type: 'image/webp' });
+  await dec.tracks.ready;
   await dec.completed;
   const track = dec.tracks.selectedTrack;
   const n = (track && track.frameCount) || 1;
