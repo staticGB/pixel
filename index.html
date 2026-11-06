@@ -41,7 +41,7 @@
 <div class="wrap">
   <aside>
     <h1>PIXEL</h1>
-    <div class="sub">gif to pixel art.<br>runs in your browser. nothing uploaded.</div>
+    <div class="sub">gif, webp or video to pixel art.<br>runs in your browser. nothing uploaded.</div>
 
     <div class="group">
       <label>PIXEL SIZE <b id="vBlock">4</b></label>
@@ -504,14 +504,22 @@ function pixelate(gif, block, palMode, dither){
     const n = parseInt(palMode.split(':')[1], 10);
     // one palette per frame -> no colour bleed between the cycling hues,
     // merged into a single table so the GIF stays small and flicker-free
-    const merged = [], map = new Map();
+    const merged = [];
+    const near = (c) => {
+      for (let i = 0; i < merged.length; i++){
+        const m = merged[i];
+        const dr = m[0] - c[0], dg = m[1] - c[1], db = m[2] - c[2];
+        if (dr*dr + dg*dg + db*db < 120) return i;
+      }
+      return -1;
+    };
     q = small.map(s => {
       const p = autoPalette([s], n);
       const f = quantise([s], p, dither)[0];
       const remap = p.map(c => {
-        const k = (c[0] << 16) | (c[1] << 8) | c[2];
-        if (!map.has(k)){ map.set(k, merged.length); merged.push(c); }
-        return map.get(k);
+        let at = near(c);
+        if (at < 0){ at = merged.length; merged.push(c); }
+        return at;
       });
       for (let i = 0; i < f.idx.length; i++) f.idx[i] = remap[f.idx[i]];
       return f;
