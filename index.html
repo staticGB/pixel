@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PIXEL — gif to pixel art</title>
+<style>
+  :root{ --bg:#0b0b0d; --panel:#141417; --line:#26262b; --ink:#e8e8ea; --dim:#8a8a93; --accent:#b6ff3d; }
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; }
+  body{ background:var(--bg); color:var(--ink); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .wrap{ display:grid; grid-template-columns:300px 1fr; height:100vh; }
+  aside{ border-right:1px solid var(--line); padding:20px; overflow-y:auto; }
+  h1{ font-size:15px; letter-spacing:.28em; margin:0 0 4px; font-weight:700; }
+  .sub{ color:var(--dim); font-size:11px; margin-bottom:22px; line-height:1.45; }
+  .group{ margin-bottom:20px; }
+  label{ display:flex; justify-content:space-between; font-size:11px; color:var(--dim); letter-spacing:.08em; margin-bottom:7px; }
+  label b{ color:var(--ink); font-weight:600; }
+  input[type=range]{ width:100%; accent-color:var(--accent); height:18px; }
+  select{ width:100%; background:#0b0b0d; color:var(--ink); border:1px solid var(--line); padding:8px; font:inherit; font-size:12px; border-radius:3px; }
+  button{ width:100%; padding:10px; background:var(--accent); color:#0b0b0d; border:0; font:inherit; font-weight:700;
+          font-size:12px; letter-spacing:.06em; border-radius:3px; cursor:pointer; }
+  button.ghost{ background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button:disabled{ opacity:.35; cursor:default; }
+  .row{ display:grid; gap:8px; margin-bottom:14px; }
+  .meta{ font-size:11px; color:var(--dim); border-top:1px solid var(--line); padding-top:12px; margin-top:18px; line-height:1.7; white-space:pre-line; }
+  main{ display:flex; align-items:center; justify-content:center; padding:26px; position:relative; }
+  #stage{ display:grid; gap:22px; justify-items:center; }
+  figure{ margin:0; display:grid; gap:7px; justify-items:center; }
+  figcaption{ font-size:10px; color:var(--dim); letter-spacing:.18em; }
+  canvas{ display:block; image-rendering:pixelated; background:#000; border:1px solid var(--line); max-width:100%; max-height:52vh; }
+  #drop{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column;
+         gap:10px; color:var(--dim); font-size:12px; letter-spacing:.06em; background:var(--bg); }
+  #drop.hide{ display:none; }
+  #drop.over{ background:#11130d; color:var(--accent); }
+  #drop span{ font-size:11px; opacity:.6; }
+  .busy{ color:var(--accent); font-size:11px; letter-spacing:.1em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <aside>
+    <h1>PIXEL</h1>
+    <div class="sub">gif to pixel art.<br>runs in your browser. nothing uploaded.</div>
+
+    <div class="group">
+      <label>PIXEL SIZE <b id="vBlock">4</b></label>
+      <input id="block" type="range" min="2" max="16" step="1" value="4">
+    </div>
+
+    <div class="group">
+      <label>COLOURS</label>
+      <select id="pal">
+        <option value="auto:32" selected>auto 32 (16-bit)</option>
+        <option value="auto:16">auto 16</option>
+        <option value="auto:8">auto 8</option>
+        <option value="NES">NES</option>
+        <option value="PICO8">PICO-8</option>
+        <option value="C64">Commodore 64</option>
+        <option value="GB">Game Boy</option>
+        <option value="GBP">Game Boy Pocket</option>
+        <option value="SPECTRUM">ZX Spectrum</option>
+      </select>
+    </div>
+
+    <div class="group">
+      <label>DITHER</label>
+      <select id="dither">
+        <option value="grid" selected>grid (ordered)</option>
+        <option value="fs">smooth (floyd-steinberg)</option>
+        <option value="none">none (flat bands)</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <button id="pick" class="ghost">CHOOSE GIF</button>
+      <button id="save" disabled>DOWNLOAD GIF</button>
+    </div>
+    <input id="file" type="file" accept="image/gif" hidden>
+
+    <div class="meta" id="meta">no file yet</div>
+  </aside>
+
+  <main>
+    <div id="stage"></div>
+    <div id="drop">
+      <div>drop a gif here</div>
+      <span>or hit choose gif</span>
+    </div>
+  </main>
+</div>
+
+<script>
+/*CORE-START*/
+/* ---------- GIF decode ---------- */
+function lzwDecode(minCode, data, npix){
+  const clear = 1 << minCode, eoi = clear + 1;
+  let codeSize = minCode + 1, next = eoi + 1;
+  let dict = [];
+  const reset = () => {
+    dict = [];
+    for (let i = 0; i < clear; i++) dict[i] = [i];
+    next = eoi + 1; codeSize = minCode + 1;
+  };
+  reset();
+  const out = new Uint8Array(npix);
+  let oi = 0, bitPos = 0, prev = null;
+  const readCode = () => {
+    let code = 0;
+    for (let i = 0; i < codeSize; i++){
+      const byte = data[bitPos >> 3];
+      if (byte === undefined) return -1;
+      code |= ((byte >> (bitPos & 7)) & 1) << i;
+      bitPos++;
+    }
+    return code;
+  };
+  while (oi < npix){
+    const code = readCode();
+    if (code < 0) break;
+    if (code === clear){ reset(); prev = null; continue; }
+    if (code === eoi) break;
+    let entry;
+    if (dict[code]) entry = dict[code];
+    else if (prev) entry = prev.concat(prev[0]);
+    else break;
+    for (let i = 0; i < entry.length && oi < npix; i++) out[oi++] = entry[i];
+    if (prev){
+      dict[next++] = prev.concat(entry[0]);
+      if (next === (1 << codeSize) && codeSize < 12) codeSize++;
+    }
+    prev = entry;
+  }
+  return out;
+}
+
+function deinterlace(src, w, h){
+  const out = new Uint8Array(w * h);
+  const passes = [[0,8],[4,8],[2,4],[1,2]];
+  let p = 0;
+  for (const [start, step] of passes){
+    for (let y = start; y < h; y += step){
+      out.set(src.subarray(p * w, p * w + w), y * w);
+      p++;
+    }
+  }
+  return out;
+}
+
+function gifDecode(u8){
+  let p = 0;
+  p = 6;                                        // GIF87a / GIF89a
+  const W = u8[p] | (u8[p+1] << 8), H = u8[p+2] | (u8[p+3] << 8);
+  p += 4;
+  const packed = u8[p++]; p++; p++;             // bg, aspect
+  const gctSize = 1 << ((packed & 7) + 1);
+  let gct = null;
+  if (packed >> 7){ gct = u8.slice(p, p + gctSize * 3); p += gctSize * 3; }
+
+  const raw = [];
+  let gce = { delay:10, disposal:0, transparent:-1 };
+  let loop = 0;
+
+  while (p < u8.length){
+    const b = u8[p++];
+    if (b === 0x3B) break;
+    if (b === 0x21){
+      const label = u8[p++];
+      if (label === 0xF9){
+        const size = u8[p];
+        const pk = u8[p+1];
+        const delay = u8[p+2] | (u8[p+3] << 8);
+        const tIdx = u8[p+4];
+        gce = { delay, disposal:(pk >> 2) & 7, transparent:(pk & 1) ? tIdx : -1 };
+        p += size + 2;                          // block + terminator
+      } else if (label === 0xFF){
+        const size = u8[p++];
+        const app = String.fromCharCode.apply(null, u8.slice(p, p + 11));
+        p += size;
+        if (app.indexOf('NETSCAPE') === 0){
+          const sz = u8[p];
+          loop = u8[p+2] | (u8[p+3] << 8);
+          p += sz + 2;
+        } else {
+          while (u8[p] !== 0) p += u8[p] + 1;
+          p++;
+        }
+      } else {
+        while (u8[p] !== 0) p += u8[p] + 1;
+        p++;
+      }
+    } else if (b === 0x2C){
+      const left = u8[p] | (u8[p+1] << 8), top = u8[p+2] | (u8[p+3] << 8);
+      const fw = u8[p+4] | (u8[p+5] << 8), fh = u8[p+6] | (u8[p+7] << 8);
+      const pk = u8[p+8]; p += 9;
+      const lctSize = 1 << ((pk & 7) + 1);
+      const interlace = (pk >> 6) & 1;
+      let ct = gct, ctN = gctSize;
+      if (pk >> 7){ ct = u8.slice(p, p + lctSize * 3); p += lctSize * 3; ctN = lctSize; }
+      const minCode = u8[p++];
+      const chunks = [];
+      let total = 0;
+      while (u8[p] !== 0){ const n = u8[p++]; chunks.push(u8.subarray(p, p + n)); total += n; p += n; }
+      p++;
+      const buf = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks){ buf.set(c, off); off += c.length; }
+      let idx = lzwDecode(minCode, buf, fw * fh);
+      if (interlace) idx = deinterlace(idx, fw, fh);
+      raw.push({ left, top, fw, fh, idx, ct, ctN, gce:{ ...gce } });
+    } else break;
+  }
+
+  const canvas = new Uint8ClampedArray(W * H * 4);
+  const frames = [];
+  for (const f of raw){
+    const saved = f.gce.disposal === 3 ? canvas.slice() : null;
+    for (let y = 0; y < f.fh; y++){
+      for (let x = 0; x < f.fw; x++){
+        const i = f.idx[y * f.fw + x];
+        if (i === f.gce.transparent) continue;
+        const X = f.left + x, Y = f.top + y;
+        if (X >= W || Y >= H) continue;
+        const o = (Y * W + X) * 4, c = i * 3;
+        canvas[o] = f.ct[c]; canvas[o+1] = f.ct[c+1]; canvas[o+2] = f.ct[c+2]; canvas[o+3] = 255;
+      }
+    }
+    frames.push({ data: canvas.slice(), delay: f.gce.delay, w: W, h: H });
+    if (f.gce.disposal === 2){
+      for (let y = 0; y < f.fh; y++) for (let x = 0; x < f.fw; x++){
+        const X = f.left + x, Y = f.top + y;
+        if (X >= W || Y >= H) continue;
+        const o = (Y * W + X) * 4;
+        canvas[o] = canvas[o+1] = canvas[o+2] = canvas[o+3] = 0;
+      }
+    } else if (f.gce.disposal === 3 && saved) canvas.set(saved);
+  }
+  return { W, H, frames, loop };
+}
+
+/* ---------- shrink (area average, deterministic) ---------- */
+function boxShrink(frame, factor){
+  const W = frame.w, H = frame.h;
+  const outW = Math.max(1, Math.round(W / factor));
+  const outH = Math.max(1, Math.round(H / factor));
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  const sx = W / outW, sy = H / outH;
+  const data = frame.data;
+  for (let oy = 0; oy < outH; oy++){
+    const y0 = Math.floor(oy * sy), y1 = Math.min(H, Math.ceil((oy + 1) * sy));
+    for (let ox = 0; ox < outW; ox++){
+      const x0 = Math.floor(ox * sx), x1 = Math.min(W, Math.ceil((ox + 1) * sx));
+      let r = 0, g = 0, b = 0, a = 0, n = 0;
+      for (let y = y0; y < y1; y++){
+        let o = (y * W + x0) * 4;
+        for (let x = x0; x < x1; x++, o += 4){
+          const al = data[o+3] / 255;
+          r += data[o] * al; g += data[o+1] * al; b += data[o+2] * al;
+          a += data[o+3]; n++;
+        }
+      }
+      const o = (oy * outW + ox) * 4;
+      if (n === 0) continue;
+      const alpha = a / n;
+      const k = alpha > 0 ? 255 / alpha : 0;
+      out[o] = r / n * k * (alpha/255);
+      out[o+1] = g / n * k * (alpha/255);
+      out[o+2] = b / n * k * (alpha/255);
+      out[o+3] = alpha;
+    }
+  }
+  return { data: out, w: outW, h: outH, delay: frame.delay };
+}
+
+/* ---------- palettes ---------- */
+const PALETTES = {
+  NES: [[0,0,0],[124,124,124],[0,0,252],[0,0,188],[68,40,188],[148,0,132],[168,0,32],[168,16,0],[136,20,0],[0,116,0],
+        [0,148,0],[0,120,0],[0,88,0],[0,64,88],[188,188,188],[0,120,248],[0,88,248],[104,68,252],[216,0,204],[228,0,88],
+        [248,56,0],[228,92,16],[172,124,0],[0,184,0],[0,168,0],[0,168,68],[0,136,136],[248,248,248],[60,188,252],[104,136,252],
+        [152,120,248],[248,120,248],[248,88,152],[248,120,88],[252,160,68],[248,184,0],[184,248,24],[88,216,84],[88,248,152],[0,232,216],
+        [120,120,120],[252,252,252],[164,228,252],[184,184,248],[216,184,248],[248,184,248],[248,164,192],[240,208,176],[252,224,168],[248,216,120],
+        [216,248,120],[184,248,184],[184,248,216],[0,252,252],[216,216,216]],
+  PICO8: [[0,0,0],[29,43,83],[126,37,83],[0,135,81],[171,82,54],[95,87,79],[194,195,199],[255,241,232],
+          [255,0,77],[255,163,0],[255,236,39],[0,228,54],[41,173,255],[131,118,156],[255,119,168],[255,204,170]],
+  C64: [[0,0,0],[255,255,255],[161,77,67],[106,191,199],[161,87,164],[92,172,95],[64,64,223],[191,206,137],
+        [161,104,60],[108,80,21],[203,126,117],[98,98,98],[137,137,137],[154,226,155],[124,124,255],[173,173,173]],
+  GB: [[0,63,0],[46,115,32],[140,191,10],[160,207,10]],
+  GBP: [[0,0,0],[85,85,85],[170,170,170],[255,255,255]],
+  SPECTRUM: [[0,0,0],[0,39,251],[252,48,22],[255,63,252],[0,249,44],[0,252,254],[255,253,51],[255,255,255]]
+};
+
+/* ---------- median cut (shared palette across every frame) ---------- */
+function medianCut(points, n){
+  if (points.length === 0) return [[0,0,0]];
+  let boxes = [points];
+  const span = (box) => {
+    let mn = [255,255,255], mx = [0,0,0];
+    for (const p of box) for (let c = 0; c < 3; c++){
+      if (p[c] < mn[c]) mn[c] = p[c];
+      if (p[c] > mx[c]) mx[c] = p[c];
+    }
+    return [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]];
+  };
+  while (boxes.length < n){
+    let bi = 0, best = -1;
+    for (let i = 0; i < boxes.length; i++){
+      if (boxes[i].length < 2) continue;
+      const s = span(boxes[i]);
+      const v = Math.max(s[0], s[1], s[2]);
+      if (v > best){ best = v; bi = i; }
+    }
+    if (best <= 0) break;
+    const box = boxes[bi];
+    const s = span(box);
+    const axis = s.indexOf(Math.max(s[0], s[1], s[2]));
+    box.sort((a, b) => a[axis] - b[axis]);
+    const mid = box.length >> 1;
+    boxes.splice(bi, 1, box.slice(0, mid), box.slice(mid));
+  }
+  return boxes.filter(b => b.length).map(box => {
+    let r = 0, g = 0, b = 0;
+    for (const p of box){ r += p[0]; g += p[1]; b += p[2]; }
+    return [Math.round(r/box.length), Math.round(g/box.length), Math.round(b/box.length)];
+  });
+}
+
+function autoPalette(frames, n){
+  const pts = [];
+  const step = Math.max(1, Math.floor(frames.length / 6));
+  for (let i = 0; i < frames.length; i += step){
+    const d = frames[i].data;
+    for (let o = 0; o < d.length; o += 4 * 3){
+      if (d[o+3] < 8) continue;
+      pts.push([d[o], d[o+1], d[o+2]]);
+    }
+  }
+  return medianCut(pts, n);
+}
+
+/* ---------- quantise + dither ---------- */
+const BAYER8 = (() => {
+  let m = [[0]];
+  for (let n = 0; n < 3; n++){
+    const s = m.length, nx = [];
+    for (let y = 0; y < s * 2; y++){ nx.push(new Array(s * 2).fill(0)); }
+    for (let y = 0; y < s; y++) for (let x = 0; x < s; x++){
+      const v = m[y][x] * 4;
+      nx[y][x] = v; nx[y][x + s] = v + 2; nx[y + s][x] = v + 3; nx[y + s][x + s] = v + 1;
+    }
+    m = nx;
+  }
+  return m.map(row => row.map(v => (v + 0.5) / 64 - 0.5));
+})();
+
+function quantise(frames, pal, dither){
+  const out = [];
+  const cache = new Map();
+  const nearest = (r, g, b) => {
+    const key = (r << 16) | (g << 8) | b;
+    let hit = cache.get(key);
+    if (hit !== undefined) return hit;
+    let bi = 0, bd = 1e9;
+    for (let i = 0; i < pal.length; i++){
+      const p = pal[i];
+      const dr = r - p[0], dg = g - p[1], db = b - p[2];
+      const d = dr*dr*3 + dg*dg*4 + db*db*2;
+      if (d < bd){ bd = d; bi = i; }
+    }
+    cache.set(key, bi);
+    return bi;
+  };
+  const clamp = (v) => v < 0 ? 0 : (v > 255 ? 255 : v);
+
+  for (const f of frames){
+    const w = f.w, h = f.h;
+    const idx = new Uint8Array(w * h);
+    if (dither === 'fs'){
+      const err = new Float32Array((w + 2) * (h + 2) * 3);
+      for (let y = 0; y < h; y++){
+        for (let x = 0; x < w; x++){
+          const o = (y * w + x) * 4;
+          const e = ((y + 1) * (w + 2) + (x + 1)) * 3;
+          const r = f.data[o] + err[e];
+          const g = f.data[o+1] + err[e+1];
+          const b = f.data[o+2] + err[e+2];
+          const ci = nearest(clamp(r | 0), clamp(g | 0), clamp(b | 0));
+          idx[y * w + x] = ci;
+          const p = pal[ci];
+          const dr = r - p[0], dg = g - p[1], db = b - p[2];
+          const spread = (xx, yy, k) => {
+            const t = ((y + 1 + yy) * (w + 2) + (x + 1 + xx)) * 3;
+            err[t] += dr * k; err[t+1] += dg * k; err[t+2] += db * k;
+          };
+          spread(1,0,7/16); spread(-1,1,3/16); spread(0,1,5/16); spread(1,1,1/16);
+        }
+      }
+    } else if (dither === 'grid'){
+      const amt = 34;
+      for (let y = 0; y < h; y++){
+        for (let x = 0; x < w; x++){
+          const o = (y * w + x) * 4;
+          if (f.data[o+3] < 8){ idx[y * w + x] = 0; continue; }
+          const t = BAYER8[y & 7][x & 7] * amt;
+          idx[y * w + x] = nearest(
+            clamp(f.data[o] + t) | 0,
+            clamp(f.data[o+1] + t) | 0,
+            clamp(f.data[o+2] + t) | 0
+          );
+        }
+      }
+    } else {
+      for (let o = 0, i = 0; o < f.data.length; o += 4, i++){
+        if (f.data[o+3] < 8){ idx[i] = 0; continue; }
+        idx[i] = nearest(f.data[o], f.data[o+1], f.data[o+2]);
+      }
+    }
+    out.push({ idx, w, h, delay: f.delay });
+  }
+  return out;
+}
+
+/* ---------- GIF encode ---------- */
+function lzwEncode(minCode, indices){
+  const clear = 1 << minCode, eoi = clear + 1;
+  let codeSize = minCode + 1, next = eoi + 1;
+  let table = new Map();
+  const bytes = [];
+  let cur = 0, bits = 0;
+  const emit = (code) => {
+    cur |= code << bits;
+    bits += codeSize;
+    while (bits >= 8){ bytes.push(cur & 255); cur >>= 8; bits -= 8; }
+  };
+  emit(clear);
+  let prefix = indices[0] & (clear - 1);
+  for (let i = 1; i < indices.length; i++){
+    const k = indices[i] & (clear - 1);
+    const key = (prefix << 8) | k;
+    const hit = table.get(key);
+    if (hit !== undefined){ prefix = hit; continue; }
+    emit(prefix);
+    if (next === 4096){
+      emit(clear);
+      table = new Map(); next = eoi + 1; codeSize = minCode + 1;
+    } else {
+      if (next >= (1 << codeSize) && codeSize < 12) codeSize++;
+      table.set(key, next++);
+    }
+    prefix = k;
+  }
+  emit(prefix);
+  emit(eoi);
+  if (bits > 0) bytes.push(cur & 255);
+  return bytes;
+}
+
+function gifEncode(frames, W, H, pal, loop){
+  const out = [];
+  const push = (...b) => { for (const v of b) out.push(v & 255); };
+  const pushStr = (s) => { for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i)); };
+
+  let size = 2;
+  while (size < pal.length) size <<= 1;
+  const bits = Math.log2(size);
+  const minCode = Math.max(2, bits);
+
+  pushStr('GIF89a');
+  push(W & 255, W >> 8, H & 255, H >> 8, 0x80 | ((bits - 1) & 7), 0, 0);
+  for (let i = 0; i < size; i++){
+    const c = pal[i] || [0,0,0];
+    push(c[0], c[1], c[2]);
+  }
+  if (loop !== undefined && loop >= 0){
+    push(0x21, 0xFF, 0x0B); pushStr('NETSCAPE2.0');
+    push(0x03, 0x01, loop & 255, loop >> 8, 0x00);
+  }
+  for (const f of frames){
+    const delay = Math.max(2, f.delay || 10);
+    push(0x21, 0xF9, 0x04, 0x04, delay & 255, delay >> 8, 0x00, 0x00);
+    push(0x2C, 0, 0, 0, 0, W & 255, W >> 8, H & 255, H >> 8, 0x00);
+    push(minCode);
+    const data = lzwEncode(minCode, f.idx);
+    for (let i = 0; i < data.length; i += 255){
+      const chunk = data.slice(i, i + 255);
+      push(chunk.length, ...chunk);
+    }
+    push(0x00);
+  }
+  push(0x3B);
+  return new Uint8Array(out);
+}
+
+/* ---------- pipeline ---------- */
+function pixelate(gif, block, palMode, dither){
+  const small = gif.frames.map(f => boxShrink(f, block));
+  let pal, q;
+
+  if (palMode.indexOf('auto:') === 0){
+    const n = parseInt(palMode.split(':')[1], 10);
+    // one palette per frame -> no colour bleed between the cycling hues,
+    // merged into a single table so the GIF stays small and flicker-free
+    const merged = [], map = new Map();
+    q = small.map(s => {
+      const p = autoPalette([s], n);
+      const f = quantise([s], p, dither)[0];
+      const remap = p.map(c => {
+        const k = (c[0] << 16) | (c[1] << 8) | c[2];
+        if (!map.has(k)){ map.set(k, merged.length); merged.push(c); }
+        return map.get(k);
+      });
+      for (let i = 0; i < f.idx.length; i++) f.idx[i] = remap[f.idx[i]];
+      return f;
+    });
+    pal = merged;
+    if (pal.length > 256){
+      pal = autoPalette(small, n);
+      q = quantise(small, pal, dither);
+    }
+  } else {
+    pal = PALETTES[palMode] || PALETTES.PICO8;
+    q = quantise(small, pal, dither);
+  }
+
+  // keep only colours actually used, in palette order
+  const used = new Set();
+  for (const f of q) for (const v of f.idx) used.add(v);
+  const keep = [...used].sort((a, b) => a - b);
+  const remap = new Map(keep.map((c, i) => [c, i]));
+  for (const f of q) for (let i = 0; i < f.idx.length; i++) f.idx[i] = remap.get(f.idx[i]);
+  const finalPal = keep.map(i => pal[i]);
+
+  const W = small[0].w * block, H = small[0].h * block;
+  return { frames: q, palette: finalPal, W, H, small: [small[0].w, small[0].h] };
+}
+
+/* blow the art-resolution indices back up to full size with hard pixels */
+function expandFrames(res, block){
+  const w = res.small[0] * block, h = res.small[1] * block;
+  return res.frames.map(f => {
+    const idx = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++){
+      const sy = (y / block) | 0, rowIn = sy * f.w, rowOut = y * w;
+      for (let x = 0; x < w; x++) idx[rowOut + x] = f.idx[rowIn + ((x / block) | 0)];
+    }
+    return { idx, delay: f.delay };
+  });
+}
+/*CORE-END*/
+
+/* ---------------- UI ---------------- */
+const $ = (id) => document.getElementById(id);
+const elBlock = $('block'), elPal = $('pal'), elDither = $('dither');
+const elVBlock = $('vBlock'), elMeta = $('meta'), elSave = $('save');
+const elStage = $('stage'), elDrop = $('drop'), elFile = $('file');
+
+let src = null, result = null, name = 'pixel.gif';
+let rafId = 0, playStart = 0;
+
+elBlock.oninput = () => { elVBlock.textContent = elBlock.value; rebuild(); };
+elPal.onchange = rebuild;
+elDither.onchange = rebuild;
+
+$('pick').onclick = () => elFile.click();
+elFile.onchange = (e) => { if (e.target.files[0]) load(e.target.files[0]); };
+elSave.onclick = save;
+
+['dragover','dragenter'].forEach(t => window.addEventListener(t, e => { e.preventDefault(); elDrop.classList.add('over'); }));
+['dragleave','dragend'].forEach(t => window.addEventListener(t, e => { if (e.target === document.documentElement) elDrop.classList.remove('over'); }));
+window.addEventListener('drop', e => {
+  e.preventDefault(); elDrop.classList.remove('over');
+  const f = e.dataTransfer.files[0];
+  if (f) load(f);
+});
+
+function load(file){
+  if (file.type && file.type !== 'image/gif' && !/\.gif$/i.test(file.name)){
+    elMeta.textContent = 'that is not a gif';
+    return;
+  }
+  name = file.name.replace(/\.gif$/i, '') + '-pixel.gif';
+  const fr = new FileReader();
+  fr.onload = () => {
+    try {
+      const bytes = new Uint8Array(fr.result);
+      src = gifDecode(bytes);
+      if (!src.frames.length) throw new Error('no frames');
+      elDrop.classList.add('hide');
+      elMeta.textContent = 'reading ' + src.W + 'x' + src.H + ' ...';
+      rebuild();
+    } catch (err){
+      elMeta.textContent = 'could not read that gif\n' + err.message;
+    }
+  };
+  fr.readAsArrayBuffer(file);
+}
+
+function rebuild(){
+  if (!src) return;
+  const block = parseInt(elBlock.value, 10);
+  const t0 = performance.now();
+  result = pixelate(src, block, elPal.value, elDither.value);
+  const ms = Math.round(performance.now() - t0);
+  elMeta.textContent =
+    src.frames.length + ' frames  ' + src.W + 'x' + src.H + '\n' +
+    'art ' + result.small[0] + 'x' + result.small[1] + '  ' + result.palette.length + ' colours\n' +
+    'out ' + result.W + 'x' + result.H + '  ' + ms + 'ms';
+  elSave.disabled = false;
+  buildStage();
+  play();
+}
+
+function mkCanvas(w, h){
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  return c;
+}
+
+function buildStage(){
+  elStage.innerHTML = '';
+  const pair = document.createElement('div');
+  pair.style.display = 'grid';
+  pair.style.gridTemplateColumns = 'auto auto';
+  pair.style.gap = '22px';
+
+  const mk = (label, w, h) => {
+    const fig = document.createElement('figure');
+    const c = mkCanvas(w, h);
+    const cap = document.createElement('figcaption');
+    cap.textContent = label;
+    fig.appendChild(c); fig.appendChild(cap);
+    return { fig, c };
+  };
+
+  const a = mk('ORIGINAL', src.W, src.H);
+  const b = mk('PIXEL', result.W, result.H);
+  pair.appendChild(a.fig); pair.appendChild(b.fig);
+  elStage.appendChild(pair);
+
+  // fit both into the viewport
+  const maxH = window.innerHeight * 0.52;
+  const scale = Math.min(1, maxH / src.H, (window.innerWidth - 380) / (src.W + result.W + 22));
+  a.c.style.width = (src.W * scale) + 'px';
+  a.c.style.height = (src.H * scale) + 'px';
+  b.c.style.width = (result.W * scale) + 'px';
+  b.c.style.height = (result.H * scale) + 'px';
+
+  window.__cv = { a: a.c, b: b.c };
+}
+
+function drawFrame(canvas, frame, w, h){
+  const ctx = canvas.getContext('2d');
+  const c2 = mkCanvas(w, h);
+  const img = new ImageData(new Uint8ClampedArray(frame.data), w, h);
+  c2.getContext('2d').putImageData(img, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(c2, 0, 0, canvas.width, canvas.height);
+}
+
+function drawResult(canvas, q, pal, block){
+  const w = q.w * block, h = q.h * block;
+  const c2 = mkCanvas(q.w, q.h);
+  const ctx2 = c2.getContext('2d');
+  const img = ctx2.createImageData(q.w, q.h);
+  for (let i = 0; i < q.idx.length; i++){
+    const p = pal[q.idx[i]] || [0,0,0];
+    const o = i * 4;
+    img.data[o] = p[0]; img.data[o+1] = p[1]; img.data[o+2] = p[2]; img.data[o+3] = 255;
+  }
+  ctx2.putImageData(img, 0, 0);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(c2, 0, 0, w, h);
+}
+
+let frameCursor = 0, lastSwap = 0;
+function play(){
+  cancelAnimationFrame(rafId);
+  frameCursor = 0; lastSwap = performance.now();
+  const cv = window.__cv;
+  if (!cv) return;
+  const step = (now) => {
+    const d = Math.max(2, (src.frames[frameCursor] && src.frames[frameCursor].delay) || 10) * 10;
+    if (now - lastSwap >= d){
+      frameCursor = (frameCursor + 1) % src.frames.length;
+      lastSwap = now;
+    }
+    drawFrame(cv.a, src.frames[frameCursor], src.W, src.H);
+    drawResult(cv.b, result.frames[frameCursor], result.palette, parseInt(elBlock.value, 10));
+    rafId = requestAnimationFrame(step);
+  };
+  rafId = requestAnimationFrame(step);
+}
+
+function save(){
+  if (!result) return;
+  elSave.disabled = true;
+  elSave.textContent = 'WORKING...';
+  setTimeout(() => {
+    const block = parseInt(elBlock.value, 10);
+    const bytes = gifEncode(expandFrames(result, block), result.W, result.H, result.palette, 0);
+    const blob = new Blob([bytes], { type: 'image/gif' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    elSave.disabled = false;
+    elSave.textContent = 'DOWNLOAD GIF';
+  }, 30);
+}
+</script>
+</body>
+</html>
