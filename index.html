@@ -72,11 +72,16 @@
       </select>
     </div>
 
+    <div class="group" id="fpsGroup" style="display:none">
+      <label>VIDEO FPS <b id="vFps">12</b></label>
+      <input id="fps" type="range" min="6" max="24" step="1" value="12">
+    </div>
+
     <div class="row">
-      <button id="pick" class="ghost">CHOOSE GIF</button>
+      <button id="pick" class="ghost">CHOOSE FILE</button>
       <button id="save" disabled>DOWNLOAD GIF</button>
     </div>
-    <input id="file" type="file" accept="image/gif" hidden>
+    <input id="file" type="file" accept="image/gif,image/webp,image/png,image/jpeg,video/mp4,video/webm,video/quicktime,.gif,.webp,.png,.jpg,.jpeg,.mp4,.webm,.mov" hidden>
 
     <div class="meta" id="meta">no file yet</div>
   </aside>
@@ -84,8 +89,8 @@
   <main>
     <div id="stage"></div>
     <div id="drop">
-      <div>drop a gif here</div>
-      <span>or hit choose gif</span>
+      <div>drop a file here</div>
+      <span>gif &middot; webp &middot; png &middot; jpg &middot; mp4 &middot; webm</span>
     </div>
   </main>
 </div>
@@ -454,7 +459,7 @@ function lzwEncode(minCode, indices){
   return bytes;
 }
 
-function gifEncode(frames, W, H, pal, loop){
+function gifEncode(frames, W, H, pal, loop, block){
   const out = [];
   const push = (...b) => { for (const v of b) out.push(v & 255); };
   const pushStr = (s) => { for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i)); };
@@ -479,7 +484,7 @@ function gifEncode(frames, W, H, pal, loop){
     push(0x21, 0xF9, 0x04, 0x04, delay & 255, delay >> 8, 0x00, 0x00);
     push(0x2C, 0, 0, 0, 0, W & 255, W >> 8, H & 255, H >> 8, 0x00);
     push(minCode);
-    const data = lzwEncode(minCode, f.idx);
+    const data = lzwEncode(minCode, block > 1 ? expandOne(f.idx, f.w, f.h, block) : f.idx);
     for (let i = 0; i < data.length; i += 255){
       const chunk = data.slice(i, i + 255);
       push(chunk.length, ...chunk);
@@ -533,17 +538,114 @@ function pixelate(gif, block, palMode, dither){
   return { frames: q, palette: finalPal, W, H, small: [small[0].w, small[0].h] };
 }
 
-/* blow the art-resolution indices back up to full size with hard pixels */
-function expandFrames(res, block){
-  const w = res.small[0] * block, h = res.small[1] * block;
-  return res.frames.map(f => {
-    const idx = new Uint8Array(w * h);
-    for (let y = 0; y < h; y++){
-      const sy = (y / block) | 0, rowIn = sy * f.w, rowOut = y * w;
-      for (let x = 0; x < w; x++) idx[rowOut + x] = f.idx[rowIn + ((x / block) | 0)];
-    }
-    return { idx, delay: f.delay };
+/* blow one art-resolution index buffer up to full size (used by the encoder
+   so a long video never has to hold every expanded frame in memory) */
+function expandOne(idx, w, h, block){
+  const W = w * block, H = h * block;
+  if (block === 1) return idx;
+  const out = new Uint8Array(W * H);
+  for (let y = 0; y < H; y++){
+    const rowIn = ((y / block) | 0) * w, rowOut = y * W;
+    for (let x = 0; x < W; x++) out[rowOut + x] = idx[rowIn + ((x / block) | 0)];
+  }
+  return out;
+}
+/* ---------- other sources: webp, stills, video ---------- */
+function fileKind(file){
+  const t = (file.type || '').toLowerCase();
+  const n = (file.name || '').toLowerCase();
+  if (t === 'image/gif' || /\.gif$/.test(n)) return 'gif';
+  if (t === 'image/webp' || /\.webp$/.test(n)) return 'webp';
+  if (/^video\//.test(t) || /\.(mp4|webm|mov|m4v)$/.test(n)) return 'video';
+  if (/^image\//.test(t) || /\.(png|jpe?g|bmp|avif)$/.test(n)) return 'image';
+  return 'unknown';
+}
+
+function frameFromBitmap(bmp, delay){
+  const cv = document.createElement('canvas');
+  cv.width = bmp.width; cv.height = bmp.height;
+  const ctx = cv.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0);
+  return { W: bmp.width, H: bmp.height, delay,
+           frames: [{ data: ctx.getImageData(0, 0, bmp.width, bmp.height).data, delay, w: bmp.width, h: bmp.height }], loop: 0 };
+}
+
+async function webpDecode(buf){
+  if (typeof ImageDecoder === 'undefined'){
+    throw new Error('this browser cannot read webp frames - use Chrome, Edge or Safari 17+');
+  }
+  const dec = new ImageDecoder({ data: buf, type: 'image/webp' });
+  await dec.completed;
+  const track = dec.tracks.selectedTrack;
+  const n = (track && track.frameCount) || 1;
+  const frames = [];
+  let W = 0, H = 0;
+  for (let i = 0; i < n; i++){
+    const { image } = await dec.decode({ frameIndex: i });
+    const cv = document.createElement('canvas');
+    cv.width = image.displayWidth; cv.height = image.displayHeight;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(image, 0, 0);
+    W = cv.width; H = cv.height;
+    const delay = Math.max(2, Math.round((image.duration || 100000) / 10000));
+    frames.push({ data: ctx.getImageData(0, 0, W, H).data, delay, w: W, h: H });
+    if (image.close) image.close();
+  }
+  return { W, H, frames, loop: 0 };
+}
+
+async function imageDecode(file){
+  const bmp = await createImageBitmap(file);
+  return frameFromBitmap(bmp, 10);
+}
+
+function seekVideo(v, t){
+  return new Promise((res) => {
+    let done = false;
+    const fire = () => { if (done) return; done = true; v.removeEventListener('seeked', fire); requestAnimationFrame(() => res()); };
+    v.addEventListener('seeked', fire);
+    setTimeout(fire, 2500);
+    v.currentTime = t;
   });
+}
+
+async function videoDecode(file, fps, onProgress){
+  const url = URL.createObjectURL(file);
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+  try {
+    await new Promise((res, rej) => {
+      v.onloadeddata = () => res();
+      v.onerror = () => rej(new Error('cannot read that video - mp4 or webm works best'));
+      setTimeout(() => rej(new Error('video took too long to load')), 25000);
+    });
+    const vw = v.videoWidth, vh = v.videoHeight;
+    if (!vw || !vh) throw new Error('no picture in that video');
+
+    const cap = Math.min(1, 800 / vw);
+    const W = Math.max(2, Math.round(vw * cap));
+    const H = Math.max(2, Math.round(vh * cap));
+    const cv = document.createElement('canvas');
+    cv.width = W; cv.height = H;
+    const ctx = cv.getContext('2d', { willReadFrequently: true });
+
+    const dur = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+    const step = 1 / fps;
+    const plan = dur ? Math.min(200, Math.max(1, Math.ceil(dur * fps))) : 40;
+    const delay = Math.max(2, Math.round(100 / fps));
+    const frames = [];
+    for (let i = 0; i < plan; i++){
+      const t = dur ? Math.min(i * step, Math.max(0, dur - 0.03)) : i * step;
+      await seekVideo(v, t);
+      ctx.drawImage(v, 0, 0, W, H);
+      frames.push({ data: ctx.getImageData(0, 0, W, H).data, delay, w: W, h: H });
+      if (onProgress) onProgress(i + 1, plan);
+    }
+    return { W, H, frames, loop: 0 };
+  } finally {
+    URL.revokeObjectURL(url);
+    v.removeAttribute('src');
+  }
 }
 /*CORE-END*/
 
@@ -552,16 +654,21 @@ const $ = (id) => document.getElementById(id);
 const elBlock = $('block'), elPal = $('pal'), elDither = $('dither');
 const elVBlock = $('vBlock'), elMeta = $('meta'), elSave = $('save');
 const elStage = $('stage'), elDrop = $('drop'), elFile = $('file');
+const elFps = $('fps'), elVFps = $('vFps'), elFpsGroup = $('fpsGroup');
 
 let src = null, result = null, name = 'pixel.gif';
-let rafId = 0, playStart = 0;
+let rafId = 0, lastFile = null, busy = false;
 
 elBlock.oninput = () => { elVBlock.textContent = elBlock.value; rebuild(); };
 elPal.onchange = rebuild;
 elDither.onchange = rebuild;
+elFps.oninput = () => {
+  elVFps.textContent = elFps.value;
+  if (lastFile && fileKind(lastFile) === 'video') load(lastFile);
+};
 
 $('pick').onclick = () => elFile.click();
-elFile.onchange = (e) => { if (e.target.files[0]) load(e.target.files[0]); };
+elFile.onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) load(f); };
 elSave.onclick = save;
 
 ['dragover','dragenter'].forEach(t => window.addEventListener(t, e => { e.preventDefault(); elDrop.classList.add('over'); }));
@@ -572,26 +679,47 @@ window.addEventListener('drop', e => {
   if (f) load(f);
 });
 
-function load(file){
-  if (file.type && file.type !== 'image/gif' && !/\.gif$/i.test(file.name)){
-    elMeta.textContent = 'that is not a gif';
+async function load(file){
+  if (!file || busy) return;
+  const kind = fileKind(file);
+  if (kind === 'unknown'){
+    elDrop.classList.add('hide');
+    elMeta.textContent = 'cannot read that file type\n' + (file.name || '');
     return;
   }
-  name = file.name.replace(/\.gif$/i, '') + '-pixel.gif';
-  const fr = new FileReader();
-  fr.onload = () => {
-    try {
-      const bytes = new Uint8Array(fr.result);
-      src = gifDecode(bytes);
-      if (!src.frames.length) throw new Error('no frames');
-      elDrop.classList.add('hide');
-      elMeta.textContent = 'reading ' + src.W + 'x' + src.H + ' ...';
-      rebuild();
-    } catch (err){
-      elMeta.textContent = 'could not read that gif\n' + err.message;
+  busy = true;
+  lastFile = file;
+  elFpsGroup.style.display = kind === 'video' ? '' : 'none';
+  elDrop.classList.add('hide');
+  elSave.disabled = true;
+  name = (file.name || 'image').replace(/\.[^.]+$/, '') + '-pixel.gif';
+  try {
+    if (kind === 'gif'){
+      elMeta.textContent = 'reading gif...';
+      src = gifDecode(new Uint8Array(await file.arrayBuffer()));
+    } else if (kind === 'webp'){
+      elMeta.textContent = 'reading webp...';
+      src = await webpDecode(await file.arrayBuffer());
+    } else if (kind === 'video'){
+      elMeta.textContent = 'reading video...';
+      src = await videoDecode(file, parseInt(elFps.value, 10), (n, total) => {
+        elMeta.textContent = 'reading video\nframe ' + n + ' / ' + total;
+      });
+    } else {
+      elMeta.textContent = 'reading image...';
+      src = await imageDecode(file);
     }
-  };
-  fr.readAsArrayBuffer(file);
+    if (!src.frames.length) throw new Error('no frames in that file');
+    const shown = Math.min(src.frames.length, 200);
+    if (kind === 'video' && src.frames.length >= 200) src.note = 'first 200 frames only';
+    rebuild(shown);
+  } catch (err){
+    elDrop.classList.add('hide');
+    elMeta.textContent = 'could not read that file\n' + err.message;
+    elSave.disabled = true;
+  } finally {
+    busy = false;
+  }
 }
 
 function rebuild(){
@@ -603,7 +731,8 @@ function rebuild(){
   elMeta.textContent =
     src.frames.length + ' frames  ' + src.W + 'x' + src.H + '\n' +
     'art ' + result.small[0] + 'x' + result.small[1] + '  ' + result.palette.length + ' colours\n' +
-    'out ' + result.W + 'x' + result.H + '  ' + ms + 'ms';
+    'out ' + result.W + 'x' + result.H + '  ' + ms + 'ms' +
+    (src.note ? '\n' + src.note : '');
   elSave.disabled = false;
   buildStage();
   play();
@@ -647,31 +776,42 @@ function buildStage(){
   window.__cv = { a: a.c, b: b.c };
 }
 
+const scratch = { src: null, srcCtx: null, img: null, w: 0, h: 0,
+                  out: null, outCtx: null, outImg: null, ow: 0, oh: 0 };
+
 function drawFrame(canvas, frame, w, h){
+  if (!scratch.src || scratch.w !== w || scratch.h !== h){
+    scratch.src = mkCanvas(w, h);
+    scratch.srcCtx = scratch.src.getContext('2d');
+    scratch.img = scratch.srcCtx.createImageData(w, h);
+    scratch.w = w; scratch.h = h;
+  }
+  scratch.img.data.set(frame.data);
+  scratch.srcCtx.putImageData(scratch.img, 0, 0);
   const ctx = canvas.getContext('2d');
-  const c2 = mkCanvas(w, h);
-  const img = new ImageData(new Uint8ClampedArray(frame.data), w, h);
-  c2.getContext('2d').putImageData(img, 0, 0);
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(c2, 0, 0, canvas.width, canvas.height);
+  ctx.drawImage(scratch.src, 0, 0, canvas.width, canvas.height);
 }
 
 function drawResult(canvas, q, pal, block){
-  const w = q.w * block, h = q.h * block;
-  const c2 = mkCanvas(q.w, q.h);
-  const ctx2 = c2.getContext('2d');
-  const img = ctx2.createImageData(q.w, q.h);
-  for (let i = 0; i < q.idx.length; i++){
-    const p = pal[q.idx[i]] || [0,0,0];
-    const o = i * 4;
-    img.data[o] = p[0]; img.data[o+1] = p[1]; img.data[o+2] = p[2]; img.data[o+3] = 255;
+  if (!scratch.out || scratch.ow !== q.w || scratch.oh !== q.h){
+    scratch.out = mkCanvas(q.w, q.h);
+    scratch.outCtx = scratch.out.getContext('2d');
+    scratch.outImg = scratch.outCtx.createImageData(q.w, q.h);
+    scratch.ow = q.w; scratch.oh = q.h;
   }
-  ctx2.putImageData(img, 0, 0);
+  const d = scratch.outImg.data;
+  for (let i = 0; i < q.idx.length; i++){
+    const p = pal[q.idx[i]] || [0, 0, 0];
+    const o = i * 4;
+    d[o] = p[0]; d[o+1] = p[1]; d[o+2] = p[2]; d[o+3] = 255;
+  }
+  scratch.outCtx.putImageData(scratch.outImg, 0, 0);
   const ctx = canvas.getContext('2d');
   ctx.imageSmoothingEnabled = false;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(c2, 0, 0, w, h);
+  ctx.drawImage(scratch.out, 0, 0, q.w * block, q.h * block);
 }
 
 let frameCursor = 0, lastSwap = 0;
@@ -699,7 +839,7 @@ function save(){
   elSave.textContent = 'WORKING...';
   setTimeout(() => {
     const block = parseInt(elBlock.value, 10);
-    const bytes = gifEncode(expandFrames(result, block), result.W, result.H, result.palette, 0);
+    const bytes = gifEncode(result.frames, result.W, result.H, result.palette, 0, block);
     const blob = new Blob([bytes], { type: 'image/gif' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
